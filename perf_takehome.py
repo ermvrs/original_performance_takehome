@@ -187,7 +187,7 @@ class KernelBuilder:
             self.vector_cache[value] = vec_addr
         return self.vector_cache[value]
 
-    def generate(self, tree_depth, _node_count, items, num_rounds, tile_blocks=17, tile_rounds=13):
+    def build_kernel(self, tree_depth, _node_count, items, num_rounds, tile_blocks=17, tile_rounds=13):
         """
         Generate the optimized kernel.
 
@@ -483,7 +483,7 @@ def do_kernel_test(
     mem = build_mem_image(forest, inp)
 
     kb = KernelBuilder()
-    kb.generate(forest.height, len(forest.values), len(inp.indices), rounds)
+    kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
 
     value_trace = {}
     machine = Machine(
