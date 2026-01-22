@@ -5,6 +5,8 @@ Key techniques:
 - Pre-loaded tree nodes for shallow levels (avoid memory gathers)
 - Hash fusion for compatible stages
 - Tiled processing for better cache utilization
+- Speculative execution of both child paths with 2x unrolling
+- vEB-inspired parent+children access ordering for shallow tree levels
 """
 
 from collections import defaultdict
@@ -187,7 +189,7 @@ class KernelBuilder:
             self.vector_cache[value] = vec_addr
         return self.vector_cache[value]
 
-    def build_kernel(self, tree_depth, _node_count, items, num_rounds, tile_blocks=17, tile_rounds=13):
+    def build_kernel(self, tree_depth, _node_count, items, num_rounds, tile_blocks=16, tile_rounds=13):
         """
         Generate the optimized kernel.
 
@@ -295,6 +297,7 @@ class KernelBuilder:
                 "temp1": self.reserve_vector(),
                 "temp2": self.reserve_vector(),
                 "temp3": self.reserve_vector(),
+                "child_right": self.reserve_vector(),
             })
 
         # === MAIN COMPUTATION LOOP ===
@@ -311,51 +314,90 @@ class KernelBuilder:
                     idx_vec = working_idx + blk * VLEN
                     val_vec = working_val + blk * VLEN
 
-                    for rnd in range(round_base, round_limit):
-                        depth = rnd % (tree_depth + 1)
+                    def do_xor(node_vec, use_vector):
+                        if use_vector:
+                            body_ops.append(("valu", ("^", val_vec, val_vec, node_vec)))
+                            return
+                        for lane in range(VLEN):
+                            body_ops.append((
+                                "alu", ("^", val_vec + lane, val_vec + lane, node_vec + lane)
+                            ))
 
-                        # Helper: XOR value with tree node
-                        def do_xor(node_vec):
-                            for lane in range(VLEN):
-                                body_ops.append((
-                                    "alu", ("^", val_vec + lane, val_vec + lane, node_vec + lane)
-                                ))
+                    def emit_hash():
+                        for stage_idx, (op1, _, op2, op3, _) in enumerate(HASH_STAGES):
+                            if hash_multipliers[stage_idx] is not None:
+                                # Fused operation: val = val * mult + c1
+                                body_ops.append(("valu", (
+                                    "multiply_add", val_vec, val_vec,
+                                    hash_multipliers[stage_idx], hash_const1[stage_idx]
+                                )))
+                            else:
+                                # Three-operation sequence
+                                body_ops.append(("valu", (
+                                    op1, wb["temp2"], val_vec, hash_const1[stage_idx]
+                                )))
+                                body_ops.append(("valu", (
+                                    op3, wb["temp3"], val_vec, hash_const3[stage_idx]
+                                )))
+                                body_ops.append(("valu", (
+                                    op2, val_vec, wb["temp2"], wb["temp3"]
+                                )))
 
+                    def emit_index_update(depth):
+                        if depth == tree_depth:
+                            # Wrap: reset index to 0
+                            body_ops.append(("valu", ("+", idx_vec, vec_zero, vec_zero)))
+                            return None
+                        for lane in range(VLEN):
+                            body_ops.append((
+                                "alu",
+                                ("&", wb["temp2"] + lane, val_vec + lane, const_one)
+                            ))
+                            body_ops.append((
+                                "alu",
+                                ("+", wb["temp3"] + lane, wb["temp2"] + lane, const_one)
+                            ))
+                        body_ops.append(("valu", (
+                            "multiply_add", idx_vec, idx_vec, vec_two, wb["temp3"]
+                        )))
+                        return wb["temp2"]
+
+                    def emit_node_lookup(depth):
                         # Level-specific tree node lookup
                         if depth == 0:
                             # All indices are 0 at start/after wrap - use preloaded node[0]
-                            do_xor(preloaded_nodes[0])
+                            return preloaded_nodes[0]
 
-                        elif depth == 1:
+                        if depth == 1:
                             # Indices are 1 or 2 - binary selection
                             body_ops.append(("valu", ("&", wb["temp1"], idx_vec, vec_one)))
                             body_ops.append(("flow", (
                                 "vselect", wb["result"], wb["temp1"],
                                 preloaded_nodes[1], preloaded_nodes[2]
                             )))
-                            do_xor(wb["result"])
+                            return wb["result"]
 
-                        elif depth == 2:
+                        if depth == 2:
                             # Indices 3-6: two-level selection
                             body_ops.append(("valu", ("-", wb["temp1"], idx_vec, vec_three)))
                             body_ops.append(("valu", ("&", wb["temp2"], wb["temp1"], vec_one)))
-                            body_ops.append(("valu", ("&", wb["result"], wb["temp1"], vec_two)))
+                            body_ops.append(("valu", ("&", wb["temp3"], wb["temp1"], vec_two)))
 
                             body_ops.append(("flow", (
-                                "vselect", wb["temp1"], wb["temp2"],
+                                "vselect", wb["result"], wb["temp2"],
                                 preloaded_nodes[4], preloaded_nodes[3]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["temp2"], wb["temp2"],
+                                "vselect", wb["temp1"], wb["temp2"],
                                 preloaded_nodes[6], preloaded_nodes[5]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["result"], wb["result"],
-                                wb["temp2"], wb["temp1"]
+                                "vselect", wb["result"], wb["temp3"],
+                                wb["temp1"], wb["result"]
                             )))
-                            do_xor(wb["result"])
+                            return wb["result"]
 
-                        elif depth == 3:
+                        if depth == 3:
                             # Indices 7-14: three-level selection
                             body_ops.append(("valu", ("-", wb["temp1"], idx_vec, vec_seven)))
                             body_ops.append(("valu", ("&", wb["temp2"], wb["temp1"], vec_one)))
@@ -396,60 +438,100 @@ class KernelBuilder:
                                 "vselect", wb["result"], wb["temp2"],
                                 wb["result"], wb["temp1"]
                             )))
-                            do_xor(wb["result"])
+                            return wb["result"]
 
-                        else:
-                            # Deep levels: gather from memory
-                            for lane in range(VLEN):
-                                body_ops.append((
-                                    "alu",
-                                    ("+", wb["temp1"] + lane, vec_tree_base + lane, idx_vec + lane)
-                                ))
-                            for lane in range(VLEN):
-                                body_ops.append((
-                                    "load",
-                                    ("load", wb["result"] + lane, wb["temp1"] + lane)
-                                ))
-                            do_xor(wb["result"])
+                        # Deep levels: gather from memory
+                        for lane in range(VLEN):
+                            body_ops.append((
+                                "alu",
+                                ("+", wb["temp1"] + lane, vec_tree_base + lane, idx_vec + lane)
+                            ))
+                        for lane in range(VLEN):
+                            body_ops.append((
+                                "load",
+                                ("load", wb["result"] + lane, wb["temp1"] + lane)
+                            ))
+                        return wb["result"]
 
-                        # === HASH COMPUTATION ===
-                        for stage_idx, (op1, _, op2, op3, _) in enumerate(HASH_STAGES):
-                            if hash_multipliers[stage_idx] is not None:
-                                # Fused operation: val = val * mult + c1
-                                body_ops.append(("valu", (
-                                    "multiply_add", val_vec, val_vec,
-                                    hash_multipliers[stage_idx], hash_const1[stage_idx]
+                    def emit_child_nodes(depth):
+                        # vEB-inspired: precompute both child paths for the next depth.
+                        if depth == 1:
+                            body_ops.append(("flow", (
+                                "vselect", wb["result"], wb["temp1"],
+                                preloaded_nodes[3], preloaded_nodes[5]
+                            )))
+                            body_ops.append(("flow", (
+                                "vselect", wb["child_right"], wb["temp1"],
+                                preloaded_nodes[4], preloaded_nodes[6]
+                            )))
+                            return
+
+                        if depth == 2:
+                            body_ops.append(("flow", (
+                                "vselect", wb["temp1"], wb["temp2"],
+                                preloaded_nodes[9], preloaded_nodes[7]
+                            )))
+                            body_ops.append(("flow", (
+                                "vselect", wb["result"], wb["temp2"],
+                                preloaded_nodes[13], preloaded_nodes[11]
+                            )))
+                            body_ops.append(("flow", (
+                                "vselect", wb["result"], wb["temp3"],
+                                wb["result"], wb["temp1"]
+                            )))
+
+                            body_ops.append(("flow", (
+                                "vselect", wb["temp1"], wb["temp2"],
+                                preloaded_nodes[10], preloaded_nodes[8]
+                            )))
+                            body_ops.append(("flow", (
+                                "vselect", wb["child_right"], wb["temp2"],
+                                preloaded_nodes[14], preloaded_nodes[12]
+                            )))
+                            body_ops.append(("flow", (
+                                "vselect", wb["child_right"], wb["temp3"],
+                                wb["child_right"], wb["temp1"]
+                            )))
+
+                    # Loop unrolling 2x with register renaming for child buffers.
+                    for rnd in range(round_base, round_limit, 2):
+                        depth = rnd % (tree_depth + 1)
+                        has_next = rnd + 1 < round_limit
+                        spec_next = has_next and depth <= 2 and depth < tree_depth
+
+                        node_vec = emit_node_lookup(depth)
+                        do_xor(node_vec, depth in (0, 2))
+
+                        if spec_next and depth in (1, 2):
+                            emit_child_nodes(depth)
+
+                        emit_hash()
+                        emit_index_update(depth)
+
+                        if spec_next:
+                            if depth == 0:
+                                body_ops.append(("flow", (
+                                    "vselect", wb["result"], wb["temp2"],
+                                    preloaded_nodes[2], preloaded_nodes[1]
                                 )))
                             else:
-                                # Three-operation sequence
-                                body_ops.append(("valu", (
-                                    op1, wb["temp1"], val_vec, hash_const1[stage_idx]
-                                )))
-                                body_ops.append(("valu", (
-                                    op3, wb["temp2"], val_vec, hash_const3[stage_idx]
-                                )))
-                                body_ops.append(("valu", (
-                                    op2, val_vec, wb["temp1"], wb["temp2"]
+                                body_ops.append(("flow", (
+                                    "vselect", wb["result"], wb["temp2"],
+                                    wb["child_right"], wb["result"]
                                 )))
 
-                        # === INDEX UPDATE ===
-                        if depth == tree_depth:
-                            # Wrap: reset index to 0
-                            body_ops.append(("valu", ("+", idx_vec, vec_zero, vec_zero)))
+                        if not has_next:
+                            continue
+
+                        depth = (rnd + 1) % (tree_depth + 1)
+                        if spec_next:
+                            node_vec = wb["result"]
                         else:
-                            # idx = idx * 2 + (1 + (val & 1))
-                            for lane in range(VLEN):
-                                body_ops.append((
-                                    "alu",
-                                    ("&", wb["temp1"] + lane, val_vec + lane, const_one)
-                                ))
-                                body_ops.append((
-                                    "alu",
-                                    ("+", wb["result"] + lane, wb["temp1"] + lane, const_one)
-                                ))
-                            body_ops.append(("valu", (
-                                "multiply_add", idx_vec, idx_vec, vec_two, wb["result"]
-                            )))
+                            node_vec = emit_node_lookup(depth)
+
+                        do_xor(node_vec, depth in (0, 2))
+                        emit_hash()
+                        emit_index_update(depth)
 
         # === STORE RESULTS (values only - indices not validated) ===
         store_ops = []
