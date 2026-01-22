@@ -189,7 +189,7 @@ class KernelBuilder:
             self.vector_cache[value] = vec_addr
         return self.vector_cache[value]
 
-    def build_kernel(self, tree_depth, _node_count, items, num_rounds, tile_blocks=16, tile_rounds=13):
+    def build_kernel(self, tree_depth, _node_count, items, num_rounds, tile_blocks=17, tile_rounds=13):
         """
         Generate the optimized kernel.
 
@@ -233,10 +233,26 @@ class KernelBuilder:
         vec_tree_base = self.reserve_vector("vec_tree_base")
         setup_ops.append(("valu", ("vbroadcast", vec_tree_base, self.memory_map["ptr_tree"])))
 
+        def needs_depth3_lookup():
+            for round_base in range(0, num_rounds, tile_rounds):
+                round_limit = min(num_rounds, round_base + tile_rounds)
+                for rnd in range(round_base, round_limit, 2):
+                    depth = rnd % (tree_depth + 1)
+                    if depth == 3:
+                        return True
+                    has_next = rnd + 1 < round_limit
+                    spec_next = has_next and depth <= 2 and depth < tree_depth
+                    if has_next:
+                        next_depth = (rnd + 1) % (tree_depth + 1)
+                        if not spec_next and next_depth == 3:
+                            return True
+            return False
+
         # Additional vector constants for selection logic
         vec_three = self.get_vector(3, setup_ops)
-        vec_four = self.get_vector(4, setup_ops)
-        vec_seven = self.get_vector(7, setup_ops)
+        need_depth3 = needs_depth3_lookup()
+        vec_four = self.get_vector(4, setup_ops) if need_depth3 else None
+        vec_seven = self.get_vector(7, setup_ops) if need_depth3 else None
 
         # Pre-load tree nodes 0-14 for levels 0-3 (avoid gathers)
         preloaded_nodes = []
@@ -257,13 +273,14 @@ class KernelBuilder:
         hash_multipliers = []
         for stage_op1, c1, stage_op2, stage_op3, c3 in HASH_STAGES:
             hash_const1.append(self.get_vector(c1, setup_ops))
-            hash_const3.append(self.get_vector(c3, setup_ops))
             # Fuse stages where possible: val = val * (1 + 2^c3) + c1
             if stage_op1 == "+" and stage_op2 == "+" and stage_op3 == "<<":
                 multiplier = 1 + (1 << c3)
                 hash_multipliers.append(self.get_vector(multiplier, setup_ops))
+                hash_const3.append(None)
             else:
                 hash_multipliers.append(None)
+                hash_const3.append(self.get_vector(c3, setup_ops))
 
         # Working memory for indices and values
         assert items % VLEN == 0
@@ -278,7 +295,10 @@ class KernelBuilder:
 
         # Emit packed initialization
         self.instrs.extend(pack_operations(setup_ops))
-        self.emit("flow", ("pause",))
+        if self.instrs and "flow" not in self.instrs[-1]:
+            self.instrs[-1].setdefault("flow", []).append(("pause",))
+        else:
+            self.emit("flow", ("pause",))
 
         # === LOAD INITIAL DATA ===
         body_ops = []
@@ -544,7 +564,10 @@ class KernelBuilder:
 
         # Pack and emit all body operations
         self.instrs.extend(pack_operations(body_ops))
-        self.instrs.append({"flow": [("pause",)]})
+        if self.instrs and "flow" not in self.instrs[-1]:
+            self.instrs[-1].setdefault("flow", []).append(("pause",))
+        else:
+            self.instrs.append({"flow": [("pause",)]})
 
 
 BASELINE = 147734
