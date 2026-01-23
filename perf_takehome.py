@@ -189,7 +189,7 @@ class KernelBuilder:
             self.vector_cache[value] = vec_addr
         return self.vector_cache[value]
 
-    def build_kernel(self, tree_depth, _node_count, items, num_rounds, tile_blocks=16, tile_rounds=13):
+    def build_kernel(self, tree_depth, _node_count, items, num_rounds, tile_blocks=22, tile_rounds=14):
         """
         Generate the optimized kernel.
 
@@ -203,7 +203,6 @@ class KernelBuilder:
         """
         # Temporary registers for address computation
         addr_tmp = self.reserve("addr_tmp")
-        addr_tmp2 = self.reserve("addr_tmp2")
 
         # Known memory layout for benchmark (hardcoded for speed)
         TREE_BASE = 7
@@ -245,10 +244,6 @@ class KernelBuilder:
                             return True
             return False
 
-        # Broadcast tree base pointer
-        vec_tree_base = self.reserve_vector("vec_tree_base")
-        setup_ops.append(("valu", ("vbroadcast", vec_tree_base, self.memory_map["ptr_tree"])))
-
         # Additional vector constants for selection logic
         need_depth3 = needs_depth3_lookup()
         const_four = self.get_scalar(4, setup_ops) if need_depth3 else None
@@ -256,14 +251,18 @@ class KernelBuilder:
         # Pre-load tree nodes 0-14 for levels 0-3 (avoid gathers)
         preloaded_nodes = []
         NUM_PRELOAD = 15
-        for i in range(NUM_PRELOAD):
-            scalar_slot = self.reserve(f"tree_node_{i}")
+        nodes_tmp = self.reserve_vector("nodes_tmp")
+        setup_ops.append(("load", ("vload", nodes_tmp, self.memory_map["ptr_tree"])))
+        for i in range(8):
             vector_slot = self.reserve_vector(f"vec_tree_{i}")
-            offset = self.get_scalar(i, setup_ops)
-            tmp = addr_tmp if i % 2 == 0 else addr_tmp2
-            setup_ops.append(("alu", ("+", tmp, self.memory_map["ptr_tree"], offset)))
-            setup_ops.append(("load", ("load", scalar_slot, tmp)))
-            setup_ops.append(("valu", ("vbroadcast", vector_slot, scalar_slot)))
+            setup_ops.append(("valu", ("vbroadcast", vector_slot, nodes_tmp + i)))
+            preloaded_nodes.append(vector_slot)
+        offset_8 = self.get_scalar(8, setup_ops)
+        setup_ops.append(("alu", ("+", addr_tmp, self.memory_map["ptr_tree"], offset_8)))
+        setup_ops.append(("load", ("vload", nodes_tmp, addr_tmp)))
+        for i in range(8, NUM_PRELOAD):
+            vector_slot = self.reserve_vector(f"vec_tree_{i}")
+            setup_ops.append(("valu", ("vbroadcast", vector_slot, nodes_tmp + (i - 8))))
             preloaded_nodes.append(vector_slot)
 
         # Hash stage constants (with fusion for compatible stages)
@@ -319,17 +318,16 @@ class KernelBuilder:
         for _ in range(tile_blocks):
             work_buffers.append({
                 "result": self.reserve_vector(),
-                "temp1": self.reserve_vector(),
                 "temp2": self.reserve_vector(),
                 "temp3": self.reserve_vector(),
                 "child_right": self.reserve_vector(),
             })
 
         # === MAIN COMPUTATION LOOP ===
-        for group_base in range(0, num_blocks, tile_blocks):
-            for round_base in range(0, num_rounds, tile_rounds):
-                round_limit = min(num_rounds, round_base + tile_rounds)
+        for round_base in range(0, num_rounds, tile_rounds):
+            round_limit = min(num_rounds, round_base + tile_rounds)
 
+            for group_base in range(0, num_blocks, tile_blocks):
                 for buf_idx in range(tile_blocks):
                     blk = group_base + buf_idx
                     if blk >= num_blocks:
@@ -339,18 +337,21 @@ class KernelBuilder:
                     addr_vec = working_addr + blk * VLEN
                     val_vec = working_val + blk * VLEN
 
+                    xor_valu_depths = {5}
+
                     def do_xor(node_vec, use_vector):
                         if use_vector:
-                            use_vector = False
+                            body_ops.append(("valu", ("^", val_vec, val_vec, node_vec)))
+                            return
                         for lane in range(VLEN):
                             body_ops.append((
                                 "alu", ("^", val_vec + lane, val_vec + lane, node_vec + lane)
                             ))
 
-                    scalar_shift_min_depth_by_stage = {
-                        3: 10,
-                        5: 8,
-                    }
+                    scalar_shift_stage = 5
+                    scalar_shift_min_depth = 6
+                    scalar_op1_stage = None
+                    scalar_op1_min_depth = 0
 
                     def emit_hash(depth):
                         for stage_idx, (op1, _, op2, op3, _) in enumerate(HASH_STAGES):
@@ -362,12 +363,29 @@ class KernelBuilder:
                                 )))
                             else:
                                 # Three-operation sequence
-                                body_ops.append(("valu", (
-                                    op1, wb["temp2"], val_vec, hash_const1[stage_idx]
-                                )))
+                                use_scalar_op1 = (
+                                    scalar_op1_stage is not None
+                                    and stage_idx == scalar_op1_stage
+                                    and depth >= scalar_op1_min_depth
+                                )
+                                if use_scalar_op1:
+                                    for lane in range(VLEN):
+                                        body_ops.append((
+                                            "alu",
+                                            (
+                                                op1,
+                                                wb["temp2"] + lane,
+                                                val_vec + lane,
+                                                hash_const1[stage_idx] + lane,
+                                            ),
+                                        ))
+                                else:
+                                    body_ops.append(("valu", (
+                                        op1, wb["temp2"], val_vec, hash_const1[stage_idx]
+                                    )))
                                 use_scalar_shift = (
-                                    stage_idx in scalar_shift_min_depth_by_stage
-                                    and depth >= scalar_shift_min_depth_by_stage[stage_idx]
+                                    stage_idx == scalar_shift_stage
+                                    and depth >= scalar_shift_min_depth
                                     and hash_shift_scalar[stage_idx] is not None
                                 )
                                 if use_scalar_shift:
@@ -423,8 +441,13 @@ class KernelBuilder:
 
                         if depth == 1:
                             # Indices are 1 or 2 - binary selection
+                            for lane in range(VLEN):
+                                body_ops.append((
+                                    "alu",
+                                    ("&", wb["temp2"] + lane, addr_vec + lane, const_one)
+                                ))
                             body_ops.append(("flow", (
-                                "vselect", wb["result"], addr_vec,
+                                "vselect", wb["result"], wb["temp2"],
                                 preloaded_nodes[2], preloaded_nodes[1]
                             )))
                             return wb["result"]
@@ -446,12 +469,12 @@ class KernelBuilder:
                                 preloaded_nodes[4], preloaded_nodes[3]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["temp1"], wb["temp2"],
+                                "vselect", wb["child_right"], wb["temp2"],
                                 preloaded_nodes[6], preloaded_nodes[5]
                             )))
                             body_ops.append(("flow", (
                                 "vselect", wb["result"], wb["temp3"],
-                                wb["temp1"], wb["result"]
+                                wb["child_right"], wb["result"]
                             )))
                             return wb["result"]
 
@@ -473,17 +496,17 @@ class KernelBuilder:
                                 preloaded_nodes[8], preloaded_nodes[7]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["temp1"], wb["temp2"],
+                                "vselect", wb["child_right"], wb["temp2"],
                                 preloaded_nodes[10], preloaded_nodes[9]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["temp1"], wb["temp3"],
-                                wb["temp1"], wb["result"]
+                                "vselect", wb["result"], wb["temp3"],
+                                wb["child_right"], wb["result"]
                             )))
 
                             # Second pair selections
                             body_ops.append(("flow", (
-                                "vselect", wb["result"], wb["temp2"],
+                                "vselect", wb["child_right"], wb["temp2"],
                                 preloaded_nodes[12], preloaded_nodes[11]
                             )))
                             body_ops.append(("flow", (
@@ -491,8 +514,8 @@ class KernelBuilder:
                                 preloaded_nodes[14], preloaded_nodes[13]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["result"], wb["temp3"],
-                                wb["temp2"], wb["result"]
+                                "vselect", wb["child_right"], wb["temp3"],
+                                wb["temp2"], wb["child_right"]
                             )))
 
                             # Final bit selection (bit 2)
@@ -503,7 +526,7 @@ class KernelBuilder:
                                 ))
                             body_ops.append(("flow", (
                                 "vselect", wb["result"], wb["temp2"],
-                                wb["result"], wb["temp1"]
+                                wb["child_right"], wb["result"]
                             )))
                             return wb["result"]
 
@@ -519,40 +542,40 @@ class KernelBuilder:
                         # vEB-inspired: precompute both child paths for the next depth.
                         if depth == 1:
                             body_ops.append(("flow", (
-                                "vselect", wb["result"], addr_vec,
+                                "vselect", wb["result"], wb["temp2"],
                                 preloaded_nodes[5], preloaded_nodes[3]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["child_right"], addr_vec,
+                                "vselect", wb["child_right"], wb["temp2"],
                                 preloaded_nodes[6], preloaded_nodes[4]
                             )))
                             return
 
                         if depth == 2:
                             body_ops.append(("flow", (
-                                "vselect", wb["temp1"], wb["temp2"],
+                                "vselect", wb["result"], wb["temp2"],
                                 preloaded_nodes[9], preloaded_nodes[7]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["result"], wb["temp2"],
+                                "vselect", wb["child_right"], wb["temp2"],
                                 preloaded_nodes[13], preloaded_nodes[11]
                             )))
                             body_ops.append(("flow", (
                                 "vselect", wb["result"], wb["temp3"],
-                                wb["result"], wb["temp1"]
+                                wb["child_right"], wb["result"]
                             )))
 
                             body_ops.append(("flow", (
-                                "vselect", wb["temp1"], wb["temp2"],
+                                "vselect", wb["child_right"], wb["temp2"],
                                 preloaded_nodes[10], preloaded_nodes[8]
                             )))
                             body_ops.append(("flow", (
-                                "vselect", wb["child_right"], wb["temp2"],
+                                "vselect", wb["temp2"], wb["temp2"],
                                 preloaded_nodes[14], preloaded_nodes[12]
                             )))
                             body_ops.append(("flow", (
                                 "vselect", wb["child_right"], wb["temp3"],
-                                wb["child_right"], wb["temp1"]
+                                wb["temp2"], wb["child_right"]
                             )))
 
                     # Loop unrolling 2x with register renaming for child buffers.
@@ -567,7 +590,7 @@ class KernelBuilder:
                                 "+", addr_vec, addr_vec, vec_base_plus_15
                             )))
                         node_vec = emit_node_lookup(depth)
-                        do_xor(node_vec, depth in (0, 2))
+                        do_xor(node_vec, depth in xor_valu_depths)
 
                         if spec_next and depth in (1, 2):
                             emit_child_nodes(depth)
@@ -600,7 +623,7 @@ class KernelBuilder:
                         else:
                             node_vec = emit_node_lookup(depth)
 
-                        do_xor(node_vec, depth in (0, 2))
+                        do_xor(node_vec, depth in xor_valu_depths)
                         emit_hash(depth)
                         emit_index_update(depth, rnd + 1 == num_rounds - 1)
 
