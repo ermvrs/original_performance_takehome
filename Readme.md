@@ -18,3 +18,6 @@ measured in clock cycles from the simulated machine:
 If you optimize below 1487 cycles, beating Claude Opus 4.5's best performance at launch, email us at performance-recruiting@anthropic.com with your code (and ideally a resume) so we can be appropriately impressed and perhaps discuss interviewing.
 
 Run `python tests/submission_tests.py` to see which thresholds you pass.
+
+## Achieved 1131 cycles
+Spent around 10-11 hours 
